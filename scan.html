@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>สแกนบัตรพนักงาน</title>
     <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/zxing-library/0.20.0/index.min.js"></script>
+    <script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai:wght@300;400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
         *, *::before, *::after {
@@ -440,7 +440,6 @@ const barcodeOverlay = document.getElementById("barcode-overlay");
 const barcodeVideo   = document.getElementById("barcode-video");
 const barcodeClose   = document.getElementById("barcode-close");
 
-let zxingReader = null;
 let mediaStream = null;
 
 function setStatus(state, html) {
@@ -460,7 +459,8 @@ async function sendResultToChat(value, sourceLabel) {
                 { type: "text", text: "รหัสบัตรพนักงาน (" + sourceLabel + "): " + value }
             ]);
             setStatus("ok", "✅ ส่งข้อมูลกลับเข้าแชทแล้ว");
-            liff.closeWindow();
+            // หน่วงเล็กน้อยก่อนปิดหน้าต่าง เพื่อให้ WebView บางรุ่น flush การส่งข้อความเสร็จสมบูรณ์ก่อน
+            setTimeout(() => liff.closeWindow(), 300);
         } catch (sendErr) {
             console.error(sendErr);
             // สาเหตุที่พบบ่อย: เปิด LIFF ไม่ได้มาจากห้องแชท 1-on-1 กับ OA
@@ -526,37 +526,87 @@ scanBtn.addEventListener("click", async () => {
     }
 });
 
-/* ───────── Barcode เส้น (1D): scanCodeV2 อ่านไม่ได้ ใช้ ZXing เปิดกล้องเอง ───────── */
+/* ───────── Barcode เส้น (1D) + QR (2D): scanCodeV2 อ่านได้แค่ QR ใช้ ZXing เปิดกล้องเอง ───────── */
+let decodeLoopId = null;
+let zxingDecoder = null;
+
 barcodeBtn.addEventListener("click", async () => {
     resultWrap.classList.remove("show");
 
     try {
-        if (typeof ZXingBrowser === "undefined" && typeof ZXing === "undefined") {
+        if (typeof ZXing === "undefined") {
             throw new Error("โหลดไลบรารีสแกนบาร์โค้ดไม่สำเร็จ ตรวจสอบการเชื่อมต่ออินเทอร์เน็ต");
         }
 
         barcodeOverlay.classList.add("show");
 
-        // ใช้ BrowserMultiFormatReader รองรับทั้ง Code128, EAN-13, EAN-8, UPC, Code39 ฯลฯ
-        const ReaderClass = (typeof ZXingBrowser !== "undefined")
-            ? ZXingBrowser.BrowserMultiFormatReader
-            : ZXing.BrowserMultiFormatReader;
+        // ระบุ format ที่ต้องการอ่านให้ชัดเจน ครอบคลุมทั้ง 1D และ 2D
+        // ถ้าไม่ระบุ hints บางเวอร์ชันจะ default ไปลองทุก format ซึ่งช้าและจับยากกว่า
+        const hints = new Map();
+        hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+            ZXing.BarcodeFormat.QR_CODE,
+            ZXing.BarcodeFormat.CODE_128,
+            ZXing.BarcodeFormat.CODE_39,
+            ZXing.BarcodeFormat.EAN_13,
+            ZXing.BarcodeFormat.EAN_8,
+            ZXing.BarcodeFormat.UPC_A,
+            ZXing.BarcodeFormat.UPC_E,
+            ZXing.BarcodeFormat.ITF,
+            ZXing.BarcodeFormat.CODABAR
+        ]);
+        hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
 
-        zxingReader = new ReaderClass();
+        zxingDecoder = new ZXing.MultiFormatReader();
+        zxingDecoder.setHints(hints);
 
-        // ขอกล้องหลัง (environment) ก่อนเสมอ
-        const constraints = { video: { facingMode: "environment" } };
+        const constraints = {
+            video: {
+                facingMode: { ideal: "environment" },
+                width:  { ideal: 1280 },
+                height: { ideal: 720 }
+            }
+        };
         mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
         barcodeVideo.srcObject = mediaStream;
         await barcodeVideo.play();
 
-        zxingReader.decodeFromVideoElement(barcodeVideo, (result, err) => {
-            if (result) {
-                stopBarcodeScan();
-                sendResultToChat(result.getText(), "Barcode");
+        // เตรียม canvas ไว้ดึงเฟรมจาก video มา decode เอง — ควบคุมจังหวะได้แน่นอนกว่า
+        // การพึ่งพา helper ของ ZXing ที่บางครั้งไม่ทำงานในบาง browser/WebView
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+        const tick = () => {
+            if (!mediaStream) return; // ถูกปิดไปแล้ว
+
+            if (barcodeVideo.readyState === barcodeVideo.HAVE_ENOUGH_DATA) {
+                canvas.width = barcodeVideo.videoWidth;
+                canvas.height = barcodeVideo.videoHeight;
+                ctx.drawImage(barcodeVideo, 0, 0, canvas.width, canvas.height);
+
+                try {
+                    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                    const luminanceSource = new ZXing.RGBLuminanceSource(
+                        rgbaToGrayscale(imageData.data, canvas.width, canvas.height),
+                        canvas.width,
+                        canvas.height
+                    );
+                    const binaryBitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminanceSource));
+                    const result = zxingDecoder.decode(binaryBitmap);
+
+                    if (result) {
+                        stopBarcodeScan();
+                        sendResultToChat(result.getText(), result.getBarcodeFormat());
+                        return;
+                    }
+                } catch (e) {
+                    // NotFoundException คือยังไม่เจอโค้ดในเฟรมนี้ ปกติมาก ไม่ต้องแสดง error
+                }
             }
-            // err ที่เกิดระหว่าง decode แต่ละเฟรม (ยังไม่เจอโค้ด) เป็นเรื่องปกติ ไม่ต้องแสดง
-        });
+
+            decodeLoopId = requestAnimationFrame(tick);
+        };
+
+        decodeLoopId = requestAnimationFrame(tick);
 
     } catch (err) {
         console.error(err);
@@ -566,13 +616,25 @@ barcodeBtn.addEventListener("click", async () => {
     }
 });
 
+// แปลง RGBA pixel data เป็น grayscale array ตามที่ ZXing.RGBLuminanceSource ต้องการ
+function rgbaToGrayscale(data, width, height) {
+    const gray = new Uint8ClampedArray(width * height);
+    for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+        // ใช้สูตร luminance มาตรฐาน (ITU-R BT.601)
+        gray[j] = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) | 0;
+    }
+    return gray;
+}
+
 function stopBarcodeScan() {
     barcodeOverlay.classList.remove("show");
 
-    if (zxingReader) {
-        try { zxingReader.reset(); } catch (e) {}
-        zxingReader = null;
+    if (decodeLoopId) {
+        cancelAnimationFrame(decodeLoopId);
+        decodeLoopId = null;
     }
+    zxingDecoder = null;
+
     if (mediaStream) {
         mediaStream.getTracks().forEach(track => track.stop());
         mediaStream = null;
@@ -581,12 +643,6 @@ function stopBarcodeScan() {
 }
 
 barcodeClose.addEventListener("click", stopBarcodeScan);
-
-main();
-</script>
-
-</body>
-</html>
 
 main();
 </script>

@@ -316,13 +316,15 @@
             <div id="status-text">กำลังเชื่อมต่อ…</div>
         </div>
 
-        <button class="scan-btn" id="scan-btn" disabled>
+        <button class="scan-btn" id="scan-btn">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/>
                 <line x1="3" y1="12" x2="21" y2="12"/>
             </svg>
             สแกนบัตร
         </button>
+
+        <p id="diag" style="margin-top:10px;font-size:11px;color:var(--muted);font-family:'IBM Plex Mono',monospace;text-align:center;"></p>
 
         <div class="result-wrap" id="result-wrap">
             <p class="result-label">ผลการสแกน</p>
@@ -347,6 +349,7 @@ const txt        = document.getElementById("status-text");
 const scanBtn     = document.getElementById("scan-btn");
 const resultWrap  = document.getElementById("result-wrap");
 const resultValue = document.getElementById("result-value");
+const diag        = document.getElementById("diag");
 
 function setStatus(state, html) {
     wrap.className = "status-wrap " + state;
@@ -366,13 +369,11 @@ async function main() {
         const profile = await liff.getProfile();
         setStatus("ok", `สวัสดี <span class="name">${profile.displayName}</span>`);
 
-        // เปิดใช้งานปุ่มสแกนเมื่อพร้อม และอยู่ใน LINE app เท่านั้น
-        if (liff.isInClient() && liff.scanCodeV2) {
-            scanBtn.disabled = false;
-        } else {
-            scanBtn.textContent = "เปิดด้วยแอป LINE เพื่อสแกน";
-            scanBtn.disabled = true;
-        }
+        // แสดงสถานะ environment ไว้เพื่อ debug — ไม่ปิดปุ่มไว้เฉยๆ แล้ว
+        diag.textContent =
+            "inClient: " + liff.isInClient() +
+            " · scanCodeV2: " + (typeof liff.scanCodeV2 === "function") +
+            " · os: " + liff.getOS();
 
     } catch (err) {
         console.error(err);
@@ -381,25 +382,33 @@ async function main() {
 }
 
 scanBtn.addEventListener("click", async () => {
-    scanBtn.disabled = true;
     const originalText = scanBtn.innerHTML;
+    scanBtn.disabled = true;
     scanBtn.innerHTML = "กำลังเปิดกล้อง…";
+    resultWrap.classList.remove("show");
 
     try {
+        // ไม่เช็ค isInClient ล่วงหน้าแล้ว เพราะบางเวอร์ชัน LINE คืนค่าไม่ตรงกับ
+        // ความสามารถจริง — ปล่อยให้ scanCodeV2 เป็นคนบอก error เอง
+        if (typeof liff.scanCodeV2 !== "function") {
+            throw new Error("scanCodeV2 ใช้ไม่ได้บน LIFF SDK เวอร์ชันนี้ ลองอัปเดตแอป LINE");
+        }
+
         const result = await liff.scanCodeV2();
-        // result.value คือข้อความที่อ่านได้จาก QR/บาร์โค้ด
 
         if (result && result.value) {
             resultValue.textContent = result.value;
             resultWrap.classList.add("show");
             setStatus("ok", "✅ สแกนสำเร็จ");
         } else {
-            setStatus("error", "⚠ ไม่พบข้อมูลจากการสแกน");
+            setStatus("error", "⚠ ไม่พบข้อมูลจากการสแกน (ผู้ใช้อาจกดยกเลิก)");
         }
 
     } catch (err) {
         console.error(err);
-        setStatus("error", "⚠ " + err.message);
+        // error ที่พบบ่อย: ไม่ได้เปิด permission กล้องใน LINE Developers Console
+        // หรือผู้ใช้ไม่ได้ให้สิทธิ์กล้องกับแอป LINE ในระบบมือถือ
+        setStatus("error", "⚠ " + (err.message || "สแกนไม่สำเร็จ"));
     } finally {
         scanBtn.disabled = false;
         scanBtn.innerHTML = originalText;

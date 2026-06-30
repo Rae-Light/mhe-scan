@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>สแกนบัตรพนักงาน</title>
     <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/zxing-library/0.20.0/index.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai:wght@300;400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
         *, *::before, *::after {
@@ -238,6 +239,70 @@
 
         .scan-btn svg { flex-shrink: 0; }
 
+        /* secondary (outline) button for barcode */
+        .scan-btn.secondary {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text);
+        }
+
+        /* ── Barcode camera overlay ── */
+        .barcode-overlay {
+            position: fixed;
+            inset: 0;
+            background: #000;
+            z-index: 999;
+            display: none;
+            flex-direction: column;
+        }
+
+        .barcode-overlay.show { display: flex; }
+
+        .barcode-overlay video {
+            flex: 1;
+            width: 100%;
+            object-fit: cover;
+        }
+
+        .barcode-frame {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            width: 80%;
+            max-width: 320px;
+            height: 90px;
+            border: 2px solid var(--accent);
+            border-radius: 8px;
+            box-shadow: 0 0 0 2000px rgba(0,0,0,0.5);
+        }
+
+        .barcode-close {
+            position: absolute;
+            top: 20px; right: 20px;
+            width: 40px; height: 40px;
+            border-radius: 50%;
+            background: rgba(255,255,255,0.12);
+            border: none;
+            color: #fff;
+            font-size: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            z-index: 1;
+        }
+
+        .barcode-hint {
+            position: absolute;
+            bottom: 40px;
+            left: 0; right: 0;
+            text-align: center;
+            color: #fff;
+            font-size: 13px;
+            font-family: 'IBM Plex Sans Thai', sans-serif;
+            opacity: 0.8;
+        }
+
         /* ── Result block ── */
         .result-wrap {
             margin-top: 14px;
@@ -321,7 +386,19 @@
                 <path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/>
                 <line x1="3" y1="12" x2="21" y2="12"/>
             </svg>
-            สแกนบัตร
+            สแกน QR Code
+        </button>
+
+        <button class="scan-btn secondary" id="barcode-btn" style="margin-top:10px;">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="5" width="2" height="14"/>
+                <rect x="7" y="5" width="1" height="14"/>
+                <rect x="10" y="5" width="2" height="14"/>
+                <rect x="14" y="5" width="1" height="14"/>
+                <rect x="17" y="5" width="2" height="14"/>
+                <rect x="20" y="5" width="1" height="14"/>
+            </svg>
+            สแกนบาร์โค้ด
         </button>
 
         <p id="diag" style="margin-top:10px;font-size:11px;color:var(--muted);font-family:'IBM Plex Mono',monospace;text-align:center;"></p>
@@ -341,19 +418,58 @@
 
 </div>
 
+<!-- Barcode camera overlay (สำหรับบาร์โค้ดเส้น 1D ที่ scanCodeV2 อ่านไม่ได้) -->
+<div class="barcode-overlay" id="barcode-overlay">
+    <button class="barcode-close" id="barcode-close">✕</button>
+    <video id="barcode-video" muted playsinline></video>
+    <div class="barcode-frame"></div>
+    <p class="barcode-hint">เล็งบาร์โค้ดให้อยู่ในกรอบ</p>
+</div>
+
 <script>
 const LIFF_ID = "2010521821-XbCAobxK";
 
-const wrap       = document.getElementById("status-wrap");
-const txt        = document.getElementById("status-text");
-const scanBtn     = document.getElementById("scan-btn");
-const resultWrap  = document.getElementById("result-wrap");
-const resultValue = document.getElementById("result-value");
-const diag        = document.getElementById("diag");
+const wrap         = document.getElementById("status-wrap");
+const txt          = document.getElementById("status-text");
+const scanBtn       = document.getElementById("scan-btn");
+const barcodeBtn     = document.getElementById("barcode-btn");
+const resultWrap     = document.getElementById("result-wrap");
+const resultValue    = document.getElementById("result-value");
+const diag           = document.getElementById("diag");
+const barcodeOverlay = document.getElementById("barcode-overlay");
+const barcodeVideo   = document.getElementById("barcode-video");
+const barcodeClose   = document.getElementById("barcode-close");
+
+let zxingReader = null;
+let mediaStream = null;
 
 function setStatus(state, html) {
     wrap.className = "status-wrap " + state;
     txt.innerHTML = html;
+}
+
+// ส่งผลสแกน (จาก QR หรือ barcode) กลับเข้าห้องแชท LINE แล้วปิดหน้าต่าง LIFF
+async function sendResultToChat(value, sourceLabel) {
+    resultValue.textContent = value;
+    resultWrap.classList.add("show");
+    setStatus("ok", "✅ สแกนสำเร็จ กำลังส่งกลับ…");
+
+    if (liff.isInClient() && liff.sendMessages) {
+        try {
+            await liff.sendMessages([
+                { type: "text", text: "รหัสบัตรพนักงาน (" + sourceLabel + "): " + value }
+            ]);
+            setStatus("ok", "✅ ส่งข้อมูลกลับเข้าแชทแล้ว");
+            liff.closeWindow();
+        } catch (sendErr) {
+            console.error(sendErr);
+            // สาเหตุที่พบบ่อย: เปิด LIFF ไม่ได้มาจากห้องแชท 1-on-1 กับ OA
+            // หรือยังไม่ได้เปิด scope chat_message.write
+            setStatus("error", "⚠ ส่งกลับแชทไม่ได้: " + sendErr.message);
+        }
+    } else {
+        setStatus("error", "⚠ ต้องเปิดผ่านห้องแชทกับ Official Account ถึงจะส่งค่ากลับได้");
+    }
 }
 
 async function main() {
@@ -369,7 +485,6 @@ async function main() {
         const profile = await liff.getProfile();
         setStatus("ok", `สวัสดี <span class="name">${profile.displayName}</span>`);
 
-        // แสดงสถานะ environment ไว้เพื่อ debug — ไม่ปิดปุ่มไว้เฉยๆ แล้ว
         diag.textContent =
             "inClient: " + liff.isInClient() +
             " · scanCodeV2: " + (typeof liff.scanCodeV2 === "function") +
@@ -381,6 +496,7 @@ async function main() {
     }
 }
 
+/* ───────── QR Code: ใช้ liff.scanCodeV2 ของ LINE โดยตรง ───────── */
 scanBtn.addEventListener("click", async () => {
     const originalText = scanBtn.innerHTML;
     scanBtn.disabled = true;
@@ -388,8 +504,6 @@ scanBtn.addEventListener("click", async () => {
     resultWrap.classList.remove("show");
 
     try {
-        // ไม่เช็ค isInClient ล่วงหน้าแล้ว เพราะบางเวอร์ชัน LINE คืนค่าไม่ตรงกับ
-        // ความสามารถจริง — ปล่อยให้ scanCodeV2 เป็นคนบอก error เอง
         if (typeof liff.scanCodeV2 !== "function") {
             throw new Error("scanCodeV2 ใช้ไม่ได้บน LIFF SDK เวอร์ชันนี้ ลองอัปเดตแอป LINE");
         }
@@ -397,23 +511,82 @@ scanBtn.addEventListener("click", async () => {
         const result = await liff.scanCodeV2();
 
         if (result && result.value) {
-            resultValue.textContent = result.value;
-            resultWrap.classList.add("show");
-            setStatus("ok", "✅ สแกนสำเร็จ");
+            await sendResultToChat(result.value, "QR");
         } else {
             setStatus("error", "⚠ ไม่พบข้อมูลจากการสแกน (ผู้ใช้อาจกดยกเลิก)");
         }
 
     } catch (err) {
         console.error(err);
-        // error ที่พบบ่อย: ไม่ได้เปิด permission กล้องใน LINE Developers Console
-        // หรือผู้ใช้ไม่ได้ให้สิทธิ์กล้องกับแอป LINE ในระบบมือถือ
+        // error ที่พบบ่อย: ไม่ได้เปิด permission "Scan QR" ใน LINE Developers Console
         setStatus("error", "⚠ " + (err.message || "สแกนไม่สำเร็จ"));
     } finally {
         scanBtn.disabled = false;
         scanBtn.innerHTML = originalText;
     }
 });
+
+/* ───────── Barcode เส้น (1D): scanCodeV2 อ่านไม่ได้ ใช้ ZXing เปิดกล้องเอง ───────── */
+barcodeBtn.addEventListener("click", async () => {
+    resultWrap.classList.remove("show");
+
+    try {
+        if (typeof ZXingBrowser === "undefined" && typeof ZXing === "undefined") {
+            throw new Error("โหลดไลบรารีสแกนบาร์โค้ดไม่สำเร็จ ตรวจสอบการเชื่อมต่ออินเทอร์เน็ต");
+        }
+
+        barcodeOverlay.classList.add("show");
+
+        // ใช้ BrowserMultiFormatReader รองรับทั้ง Code128, EAN-13, EAN-8, UPC, Code39 ฯลฯ
+        const ReaderClass = (typeof ZXingBrowser !== "undefined")
+            ? ZXingBrowser.BrowserMultiFormatReader
+            : ZXing.BrowserMultiFormatReader;
+
+        zxingReader = new ReaderClass();
+
+        // ขอกล้องหลัง (environment) ก่อนเสมอ
+        const constraints = { video: { facingMode: "environment" } };
+        mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+        barcodeVideo.srcObject = mediaStream;
+        await barcodeVideo.play();
+
+        zxingReader.decodeFromVideoElement(barcodeVideo, (result, err) => {
+            if (result) {
+                stopBarcodeScan();
+                sendResultToChat(result.getText(), "Barcode");
+            }
+            // err ที่เกิดระหว่าง decode แต่ละเฟรม (ยังไม่เจอโค้ด) เป็นเรื่องปกติ ไม่ต้องแสดง
+        });
+
+    } catch (err) {
+        console.error(err);
+        stopBarcodeScan();
+        // สาเหตุที่พบบ่อย: ผู้ใช้ไม่อนุญาตสิทธิ์กล้องให้เบราว์เซอร์ใน LINE
+        setStatus("error", "⚠ เปิดกล้องไม่สำเร็จ: " + (err.message || "ไม่ทราบสาเหตุ"));
+    }
+});
+
+function stopBarcodeScan() {
+    barcodeOverlay.classList.remove("show");
+
+    if (zxingReader) {
+        try { zxingReader.reset(); } catch (e) {}
+        zxingReader = null;
+    }
+    if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+    }
+    barcodeVideo.srcObject = null;
+}
+
+barcodeClose.addEventListener("click", stopBarcodeScan);
+
+main();
+</script>
+
+</body>
+</html>
 
 main();
 </script>

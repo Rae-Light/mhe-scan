@@ -467,7 +467,7 @@ async function sendResultToChat(value, sourceLabel) {
     if (liff.isInClient() && liff.sendMessages) {
         try {
             await liff.sendMessages([
-                { type: "text", text: "รหัสบัตรพนักงาน (" + sourceLabel + "): " + value }
+                { type: "text", text: value }
             ]);
             setStatus("ok", "✅ ส่งข้อมูลกลับเข้าแชทแล้ว");
             // หน่วงเล็กน้อยก่อนปิดหน้าต่าง เพื่อให้ WebView บางรุ่น flush การส่งข้อความเสร็จสมบูรณ์ก่อน
